@@ -1,7 +1,7 @@
 torch>=2.0.0
 torchvision>=0.15.0
 roboflow
-torchmetrics
+torchmetrics[detection]
 matplotlib
 numpy
 Pillow

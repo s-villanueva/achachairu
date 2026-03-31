@@ -9,19 +9,21 @@ from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.rpn import AnchorGenerator
-from torchvision.models import densenet121, DenseNet121_Weights
+from torchvision.models import resnet50, ResNet50_Weights
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
 from roboflow import Roboflow
 
 # Hyperparameters
-NUM_CLASSES  = 3
+NUM_CLASSES = 3
 LEARNING_RATE = 0.005
-MOMENTUM     = 0.9
+MOMENTUM = 0.9
 WEIGHT_DECAY = 0.0005
-STEP_LR      = 5
-GAMMA_LR     = 0.1
+STEP_LR = 5
+GAMMA_LR = 0.1
+PATIENCE = 15
+
 
 class COCODataset(torch.utils.data.Dataset):
     def __init__(self, img_dir, json_path, transforms=None):
@@ -51,7 +53,7 @@ class COCODataset(torch.utils.data.Dataset):
 
         anns = self.anns[img_id]
 
-        boxes  = []
+        boxes = []
         labels = []
 
         for ann in anns:
@@ -68,15 +70,15 @@ class COCODataset(torch.utils.data.Dataset):
             labels.append(ann['category_id'])
 
         if len(boxes) == 0:
-            boxes  = torch.zeros((0, 4), dtype=torch.float32)
-            labels = torch.zeros((0,),   dtype=torch.int64)
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
         else:
-            boxes  = torch.tensor(boxes,  dtype=torch.float32)
+            boxes = torch.tensor(boxes, dtype=torch.float32)
             labels = torch.tensor(labels, dtype=torch.int64)
 
         target = {
-            'boxes':    boxes,
-            'labels':   labels,
+            'boxes': boxes,
+            'labels': labels,
             'image_id': torch.tensor([img_id])
         }
 
@@ -85,6 +87,7 @@ class COCODataset(torch.utils.data.Dataset):
 
 def collate_fn(batch):
     return tuple(zip(*batch))
+
 
 def setup_dataset():
     # Descargar el dataset solo si no existe el directorio base
@@ -97,21 +100,21 @@ def setup_dataset():
     else:
         print("Dataset './Achachairu-1' encontrado. Omitiendo descarga.")
         location = './Achachairu-1'
-        
+
     TRAIN_DIR = os.path.join(location, 'train')
     VALID_DIR = os.path.join(location, 'valid')
-    TEST_DIR  = os.path.join(location, 'test')
-    
+    TEST_DIR = os.path.join(location, 'test')
+
     TRAIN_JSON = os.path.join(TRAIN_DIR, '_annotations.coco.json')
     VALID_JSON = os.path.join(VALID_DIR, '_annotations.coco.json')
-    TEST_JSON  = os.path.join(TEST_DIR,  '_annotations.coco.json')
+    TEST_JSON = os.path.join(TEST_DIR, '_annotations.coco.json')
     return TRAIN_DIR, VALID_DIR, TEST_DIR, TRAIN_JSON, VALID_JSON, TEST_JSON
 
 
 def create_model():
-    densenet = densenet121(weights=DenseNet121_Weights.DEFAULT)
-    backbone = densenet.features
-    backbone.out_channels = 1024
+    resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
+    backbone = torch.nn.Sequential(*list(resnet.children())[:-2])
+    backbone.out_channels = 2048
 
     anchor_generator = AnchorGenerator(
         sizes=((32, 64, 128, 256, 512),),
@@ -134,25 +137,31 @@ def create_model():
 
 
 def run_experiment(batch_size, epochs, run_name, train_dir, train_json, valid_dir, valid_json, device):
-    print(f"\n{'='*55}\nIniciando escenario: Batch Size={batch_size}, Epochs={epochs}\n{'='*55}")
-    
+    print(f"\n{'=' * 55}\nIniciando escenario: Batch Size={batch_size}, Epochs={epochs}\n{'=' * 55}")
+
     output_dir = os.path.join("results", run_name)
     os.makedirs(output_dir, exist_ok=True)
-    
+
     train_dataset = COCODataset(train_dir, train_json)
     valid_dataset = COCODataset(valid_dir, valid_json)
 
+    # Para evitar Error de Memoria (OOM) en la GPU, usamos acumulación de gradientes.
+    # Se pasa por la red un "physical_batch_size" menor, pero se actualizan los pesos
+    # como si fuera el "batch_size" grande indicado por el escenario.
+    physical_batch_size = 4
+    accumulation_steps = max(1, batch_size // physical_batch_size)
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
+        batch_size=physical_batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=0 # Configurado en 0 para evitar problemas de multiprocesamiento en Windows
+        num_workers=0  # Configurado en 0 para evitar problemas de multiprocesamiento en Windows
     )
 
     valid_loader = DataLoader(
         valid_dataset,
-        batch_size=batch_size,
+        batch_size=physical_batch_size,
         shuffle=False,
         collate_fn=collate_fn,
         num_workers=0
@@ -160,7 +169,7 @@ def run_experiment(batch_size, epochs, run_name, train_dir, train_json, valid_di
 
     model = create_model()
     model.to(device)
-    
+
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=LEARNING_RATE,
@@ -173,58 +182,72 @@ def run_experiment(batch_size, epochs, run_name, train_dir, train_json, valid_di
         gamma=GAMMA_LR
     )
 
+    # AMP (Automatic Mixed Precision) Scaler para reducir el uso de VRAM a la mitad 
+    # usando flotantes de 16-bits en lugar de 32-bits para cálculos intermedios.
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == 'cuda')
+
     history = {
         'epoch': [],
         'train_loss': [],
-        'val_map50':  [],
-        'val_map':    [],
+        'val_map50': [],
+        'val_map': [],
         'val_recall': [],
-        'val_f1':     [],
-        'lr':         []
+        'val_f1': [],
+        'lr': []
     }
 
-    best_map50 = 0.0
+    best_loss = float('inf')
+    patience_counter = 0
 
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0.0
+        optimizer.zero_grad()
 
-        for images, targets in train_loader:
-            images  = [img.to(device) for img in images]
+        for i, (images, targets) in enumerate(train_loader):
+            images = [img.to(device) for img in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
+            # Ejecuta la red en Mixed Precision
+            with torch.cuda.amp.autocast(enabled=device.type == 'cuda'):
+                loss_dict = model(images, targets)
+                losses = sum(loss for loss in loss_dict.values())
+                losses = losses / accumulation_steps
 
-            optimizer.zero_grad()
-            losses.backward()
-            optimizer.step()
+            # Escala el loss y ejecuta backward
+            scaler.scale(losses).backward()
 
-            epoch_loss += losses.item()
+            # Solo actualiza los pesos cada 'accumulation_steps' veces (simula el mega-batch)
+            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            epoch_loss += losses.item() * accumulation_steps
 
         lr_scheduler.step()
         avg_loss = epoch_loss / len(train_loader)
-        
+
         # VALIDACION
         model.eval()
         metric = MeanAveragePrecision(iou_thresholds=[0.5], extended_summary=True)
 
         with torch.no_grad():
             for images, targets in valid_loader:
-                images      = [img.to(device) for img in images]
-                preds       = model(images)
-                preds_cpu   = [{k: v.cpu() for k, v in p.items()} for p in preds]
+                images = [img.to(device) for img in images]
+                preds = model(images)
+                preds_cpu = [{k: v.cpu() for k, v in p.items()} for p in preds]
                 targets_cpu = [{k: v.cpu() for k, v in t.items()} for t in targets]
                 metric.update(preds_cpu, targets_cpu)
 
         results = metric.compute()
-        map50   = results['map_50'].item()
+        map50 = results['map_50'].item()
         map_val = results['map'].item() if not torch.isnan(results['map']) else 0.0
-        recall  = results['mar_100'].item() if not torch.isnan(results['mar_100']) else 0.0
-        f1      = (2 * map50 * recall) / (map50 + recall + 1e-7)
+        recall = results['mar_100'].item() if not torch.isnan(results['mar_100']) else 0.0
+        f1 = (2 * map50 * recall) / (map50 + recall + 1e-7)
 
         current_lr = lr_scheduler.get_last_lr()[0]
-        
+
         history['epoch'].append(epoch + 1)
         history['train_loss'].append(avg_loss)
         history['val_map50'].append(map50)
@@ -233,18 +256,28 @@ def run_experiment(batch_size, epochs, run_name, train_dir, train_json, valid_di
         history['val_f1'].append(f1)
         history['lr'].append(current_lr)
 
-        print(f'Epoch [{epoch+1}/{epochs}]  Loss: {avg_loss:.4f}  '
+        print(f'Epoch [{epoch + 1}/{epochs}]  Loss: {avg_loss:.4f}  '
               f'mAP50: {map50:.4f}  mAP: {map_val:.4f}  '
               f'Recall: {recall:.4f}  F1: {f1:.4f}  '
               f'LR: {current_lr:.6f}')
-              
-        if map50 > best_map50:
-            best_map50 = map50
-            # Guardar el modelo con mejor mAP50
-            torch.save(model.state_dict(), os.path.join(output_dir, 'fasterrcnn_densenet121_best.pth'))
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            patience_counter = 0
+            # Guardar el modelo con mejor loss
+            torch.save(model.state_dict(), os.path.join(output_dir, 'fasterrcnn_resnet50_best.pth'))
+        else:
+            patience_counter += 1
+
+        if patience_counter >= PATIENCE:
+            print(
+                f'Early stopping: Entrenamiento detenido en la época {epoch + 1} por falta de mejora en la Loss Function (Train Loss).')
+            # Actualizamos la cantidad de epochs para los gráficos y resumen
+            epochs = epoch + 1
+            break
 
     # Guardar los pesos finales
-    torch.save(model.state_dict(), os.path.join(output_dir, 'fasterrcnn_densenet121_final.pth'))
+    torch.save(model.state_dict(), os.path.join(output_dir, 'fasterrcnn_resnet50_final.pth'))
 
     # Exportar metricas a CSV
     df_metrics = pd.DataFrame(history)
@@ -259,75 +292,75 @@ def run_experiment(batch_size, epochs, run_name, train_dir, train_json, valid_di
     ax1.set_ylabel('Loss')
     ax1.legend()
     ax1.grid(True)
-    
+
     ax2.plot(epochs_range, history['val_map50'], color='green', label='Val mAP50')
     ax2.set_title('mAP50 en validación')
     ax2.set_xlabel('Epoch')
     ax2.set_ylabel('mAP50')
     ax2.legend()
     ax2.grid(True)
-    
+
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'loss_map50.png'))
     plt.close(fig)
 
     # Gráfico 2: Resumen de las 4 metricas (Loss, mAP, Recall, F1)
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    axes[0,0].plot(epochs_range, history['train_loss'], color='steelblue')
-    axes[0,0].set_title('Train Loss')
-    axes[0,0].set_xlabel('Epoch')
-    axes[0,0].grid(True)
-    
-    axes[0,1].plot(epochs_range, history['val_map50'], color='green', label='mAP50')
-    axes[0,1].plot(epochs_range, history['val_map'],   color='olive', label='mAP50-95')
-    axes[0,1].set_title('mAP')
-    axes[0,1].set_xlabel('Epoch')
-    axes[0,1].legend()
-    axes[0,1].grid(True)
-    
-    axes[1,0].plot(epochs_range, history['val_recall'], color='orange')
-    axes[1,0].set_title('Recall')
-    axes[1,0].set_xlabel('Epoch')
-    axes[1,0].grid(True)
-    
-    axes[1,1].plot(epochs_range, history['val_f1'], color='red')
-    axes[1,1].set_title('F1 Score')
-    axes[1,1].set_xlabel('Epoch')
-    axes[1,1].grid(True)
-    
+    axes[0, 0].plot(epochs_range, history['train_loss'], color='steelblue')
+    axes[0, 0].set_title('Train Loss')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].grid(True)
+
+    axes[0, 1].plot(epochs_range, history['val_map50'], color='green', label='mAP50')
+    axes[0, 1].plot(epochs_range, history['val_map'], color='olive', label='mAP50-95')
+    axes[0, 1].set_title('mAP')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True)
+
+    axes[1, 0].plot(epochs_range, history['val_recall'], color='orange')
+    axes[1, 0].set_title('Recall')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].grid(True)
+
+    axes[1, 1].plot(epochs_range, history['val_f1'], color='red')
+    axes[1, 1].set_title('F1 Score')
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].grid(True)
+
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'all_metrics.png'))
     plt.close(fig)
-    
+
     return {
         'Run': run_name,
         'Batch Size': batch_size,
         'Epochs': epochs,
-        'Best mAP50': best_map50,
-        'Best mAP': max(history['val_map']),
-        'Best Recall': max(history['val_recall']),
-        'Best F1': max(history['val_f1'])
+        'Best Loss': best_loss,
+        'Best mAP50': max(history['val_map50']) if history['val_map50'] else 0.0,
+        'Best mAP': max(history['val_map']) if history['val_map'] else 0.0,
+        'Best Recall': max(history['val_recall']) if history['val_recall'] else 0.0,
+        'Best F1': max(history['val_f1']) if history['val_f1'] else 0.0
     }
+
 
 def main():
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f'Usando el dispositivo: {device}')
-    
+
     # Preparar el dataset usando Roboflow
     TRAIN_DIR, VALID_DIR, TEST_DIR, TRAIN_JSON, VALID_JSON, TEST_JSON = setup_dataset()
-    
+
     # Lista de escenarios a correr (batch_size, epochs)
     scenarios = [
-        (4, 150),
-        (8, 150),
         (16, 100),
         (16, 150),
         (32, 100),
         (32, 150)
     ]
-    
+
     all_results = []
-    
+
     for batch_size, epochs in scenarios:
         run_name = f"batch{batch_size}_epochs{epochs}"
         res = run_experiment(
@@ -341,11 +374,11 @@ def main():
             device=device
         )
         all_results.append(res)
-        
+
         # Limpiar la VRAM de CUDA para evitar quedarse sin memoria entre experimentos
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            
+
     # Guardar y mostrar el resumen global de todos los escenarios
     summary_df = pd.DataFrame(all_results)
     os.makedirs('results', exist_ok=True)
@@ -353,6 +386,7 @@ def main():
     print("\n--- RESUMEN FINAL ---")
     print(summary_df.to_string())
     print("\nTodos los escenarios completados satisfactoriamente.")
+
 
 if __name__ == '__main__':
     main()
